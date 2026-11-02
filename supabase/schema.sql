@@ -62,13 +62,13 @@ revoke all on function ledger.check_token(text) from public, anon, authenticated
 -- Everything but the event log: items, links, state.
 create or replace function public.ledger_pull(p_token text default '') returns jsonb
 language plpgsql security definer set search_path = '' as $$
-declare who text := ledger.check_token(p_token);
+declare caller text := ledger.check_token(p_token);
 begin
   return jsonb_build_object(
     'items', coalesce((select jsonb_agg(to_jsonb(i) - 'pushed_at' - 'pushed_by') from ledger.items i), '[]'),
     'links', coalesce((select jsonb_agg(to_jsonb(l) - 'pushed_at' - 'pushed_by') from ledger.links l), '[]'),
     'state', coalesce((select jsonb_agg(to_jsonb(s) - 'pushed_at' - 'pushed_by') from ledger.state s), '[]'),
-    'by', who, 'server_time', now());
+    'by', caller, 'server_time', now());
 end $$;
 
 -- One session's changes. p_batch: {project, items: [...], links: [...], events: [...], state: [...]}.
@@ -78,7 +78,7 @@ end $$;
 create or replace function public.ledger_push(p_batch jsonb, p_token text default '') returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
-  who text := ledger.check_token(p_token);
+  caller text := ledger.check_token(p_token);
   it jsonb; ln jsonb; ev jsonb; st jsonb;
   nid text; pfx text; renamed jsonb := '{}'; missing jsonb := '[]';
   n_items int := 0; n_links int := 0; n_events int := 0; n_state int := 0;
@@ -99,7 +99,7 @@ begin
               coalesce(it ->> 'quote', ''), coalesce(it ->> 'source', ''), coalesce(it ->> 'who', 'claude'),
               coalesce(it ->> 'basis', ''), coalesce(it ->> 'status', 'open'), coalesce(it ->> 'owner', ''),
               coalesce((it ->> 'priority')::int, 2), coalesce(it ->> 'tags', ''), it ->> 'created', it ->> 'updated',
-              who);
+              caller);
     else
       nid := coalesce(renamed ->> nid, nid);
       update ledger.items set
@@ -116,7 +116,7 @@ begin
         priority = case when it ? 'priority' then (it ->> 'priority')::int else priority end,
         tags = case when it ? 'tags' then it ->> 'tags' else tags end,
         updated = case when it ? 'updated' then it ->> 'updated' else updated end,
-        pushed_at = now(), pushed_by = who
+        pushed_at = now(), pushed_by = caller
       where id = nid;
       if not found then
         missing := missing || to_jsonb(nid);
@@ -128,25 +128,25 @@ begin
     insert into ledger.links(src, rel, dst, note, created, pushed_by)
     values (coalesce(renamed ->> (ln ->> 'src'), ln ->> 'src'), ln ->> 'rel',
             coalesce(renamed ->> (ln ->> 'dst'), ln ->> 'dst'), coalesce(ln ->> 'note', ''),
-            coalesce(ln ->> 'created', ''), who)
+            coalesce(ln ->> 'created', ''), caller)
     on conflict (src, rel, dst) do update set note = excluded.note, created = excluded.created,
-                                              pushed_at = now(), pushed_by = who;
+                                              pushed_at = now(), pushed_by = caller;
     n_links := n_links + 1;
   end loop;
   for ev in select * from jsonb_array_elements(coalesce(p_batch -> 'events', '[]')) loop
     insert into ledger.events(ts, action, item, detail, project, pushed_by)
     values (ev ->> 'ts', ev ->> 'action', coalesce(renamed ->> (ev ->> 'item'), ev ->> 'item'), ev ->> 'detail',
-            p_batch ->> 'project', who);
+            p_batch ->> 'project', caller);
     n_events := n_events + 1;
   end loop;
   for st in select * from jsonb_array_elements(coalesce(p_batch -> 'state', '[]')) loop
     insert into ledger.state(key, value, updated, pushed_by)
-    values (st ->> 'key', coalesce(renamed ->> (st ->> 'value'), st ->> 'value'), st ->> 'updated', who)
+    values (st ->> 'key', coalesce(renamed ->> (st ->> 'value'), st ->> 'value'), st ->> 'updated', caller)
     on conflict (key) do update set value = excluded.value, updated = excluded.updated,
-                                    pushed_at = now(), pushed_by = who;
+                                    pushed_at = now(), pushed_by = caller;
     n_state := n_state + 1;
   end loop;
-  return jsonb_build_object('renamed', renamed, 'missing', missing, 'by', who,
+  return jsonb_build_object('renamed', renamed, 'missing', missing, 'by', caller,
                             'counts', jsonb_build_object('items', n_items, 'links', n_links,
                                                          'events', n_events, 'state', n_state));
 end $$;
