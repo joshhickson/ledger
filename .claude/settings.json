@@ -1,0 +1,44 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"$CLAUDE_CODE_REMOTE\" = \"true\" ] && [ -f ~/.ledger/tool/ledger.py ] && python3 ~/.ledger/tool/ledger.py --dir ~/.ledger hook-start a || true",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "[ \"$CLAUDE_CODE_REMOTE\" = \"true\" ] && [ -f ~/.ledger/tool/ledger.py ] && python3 ~/.ledger/tool/ledger.py --dir ~/.ledger hook-start b || true",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"$CLAUDE_CODE_REMOTE\" = \"true\" ] && [ -f ~/.ledger/tool/ledger.py ] && python3 ~/.ledger/tool/ledger.py --dir ~/.ledger hook-prompt || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"$CLAUDE_CODE_REMOTE\" = \"true\" ] && [ -f ~/.ledger/tool/ledger.py ] && python3 ~/.ledger/tool/ledger.py --dir ~/.ledger hook-precompact || true",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
