@@ -33,6 +33,11 @@ machine. If you can't see a brief, see the note in CLAUDE.md under "Project ledg
   both of you see it.
 - **Closing:** close items as they finish (`set ID status=done`). Handoffs start from `handoff`.
 - **The owner's view:** the owner reads `.ledger/ledger.html`. They don't edit the ledger; they tell you.
+- **Shared ledger:** if the brief says "the shared ledger (Supabase)", one record serves all of the owner's sessions,
+  on every machine and in the cloud. Items you add go to this session's project (the repository's name, shown in the
+  brief); `--project all` is for things that apply everywhere. Other sessions may be writing at the same time: if the
+  tool says a new item's ID was taken and renumbers it, use the new ID. If the brief shows a "SHARED LEDGER
+  PROBLEM", keep working from the copy shown, and tell the owner. There is no `ledger.jsonl` to commit.
 - **Git:** `.ledger/ledger.jsonl` changes with every write. Commit it along with the work it describes. If a merge
   leaves conflict markers in it, the brief says so: remove the markers, keeping both sides' lines (the tool sorts out
   duplicates), and run `brief`.

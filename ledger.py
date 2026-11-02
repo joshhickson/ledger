@@ -43,6 +43,14 @@ Usage:  python <tool>/ledger.py [--dir <repo>/.ledger] <command>
   audit                       drift warnings
   handoff                     markdown handoff generated from the ledger
   export                      rewrite ledger.jsonl, BRIEF.md and ledger.html (also done after every write)
+Shared ledger (one record in Supabase for all of the owner's sessions, local and cloud; see supabase/schema.sql):
+  shared-setup [--owner NAME] [--url URL --key KEY] [--no-hooks] [--no-check]
+                              use it on this machine: ~/.ledger (or LEDGER_HOME) gets the config and cache, and
+                              ~/.claude/settings.json the hooks, so every session here sees it. The project is the
+                              session's repository name (LEDGER_PROJECT overrides); "all" items show everywhere
+  new-token LABEL [--save]    make an access token; prints the SQL that registers its hash, never the token
+  shared-repo [--root PATH]   add cloud-only hooks to this repository's .claude/settings.json (commit it)
+  shared-status               connection, project, last pull, changes waiting to be sent
 Hooks (read the hook JSON on stdin; quiet outside the repository):
   hook-start a|b              SessionStart: part a = focus, conflicts, waiting on the owner, promises, tasks, audit;
                               part b = goals, the owner's asks, decisions, rules (each part stays under 10,000
@@ -59,16 +67,24 @@ import os
 import pathlib
 import re
 import sqlite3
+import secrets
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIRNAME = ".ledger"
 BRIEF_MAX = 16000  # BRIEF.md is read on demand (no cap); each hook's own output stays under 10,000
 HOOK_MAX = 9500  # each SessionStart hook's additionalContext is capped at 10,000 characters
 
-LEDGER_DIR = DB = BRIEF = JSONL = HTML = CONFIG = HANDOFFS = WORKSPACE = None
+LEDGER_DIR = DB = BRIEF = JSONL = HTML = CONFIG = HANDOFFS = WORKSPACE = OUTBOX = None
 OWNER = "the owner"
+SHARED = False  # True when config.json says "backend": "supabase": the record is the shared ledger, not ledger.jsonl
+PROJECT = None  # shared ledger: this session's project (its repository's name); FAMILY = it plus "all"
+FAMILY = None
 
 KINDS = {  # kind: (id prefix, plain name; {o} = the owner's name)
     "goal": ("G", "goal"), "ask": ("A", "{o} asked for"), "rule": ("R", "rule"), "decision": ("D", "decision"),
@@ -99,7 +115,7 @@ PLURAL = {"goal": "Goals", "ask": "{o}'s asks", "rule": "Rules", "decision": "De
 FIELDS = ["title", "body", "quote", "source", "who", "basis", "status", "owner", "priority", "tags", "project"]
 ITEM_COLS = ["id", "project", "kind", "title", "body", "quote", "source", "who", "basis", "status", "owner",
              "priority", "tags", "created", "updated"]
-DEFAULT_PROJECT = "main"  # items go here unless --project names another; "all" = workspace-wide
+DEFAULT_PROJECT = "main"  # items go here unless --project names another; "all" = workspace-wide (shared: the repo)
 
 
 def o(text):
@@ -115,13 +131,38 @@ def basis_label(b, short=False):
 
 def use_dir(path):
     """Point the module at one ledger folder (<repo>/.ledger)."""
-    global LEDGER_DIR, DB, BRIEF, JSONL, HTML, CONFIG, HANDOFFS, WORKSPACE, OWNER
+    global LEDGER_DIR, DB, BRIEF, JSONL, HTML, CONFIG, HANDOFFS, WORKSPACE, OWNER, OUTBOX, SHARED
     LEDGER_DIR = os.path.abspath(path)
-    DB, BRIEF, JSONL, HTML, CONFIG = (os.path.join(LEDGER_DIR, n) for n in
-                                      ("ledger.db", "BRIEF.md", "ledger.jsonl", "ledger.html", "config.json"))
+    DB, BRIEF, JSONL, HTML, CONFIG, OUTBOX = (os.path.join(LEDGER_DIR, n) for n in (
+        "ledger.db", "BRIEF.md", "ledger.jsonl", "ledger.html", "config.json", "outbox.jsonl"))
     HANDOFFS = os.path.join(LEDGER_DIR, "handoffs")
     WORKSPACE = os.path.dirname(LEDGER_DIR)
-    OWNER = read_config().get("owner") or "the owner"
+    cfg = read_config()
+    OWNER = cfg.get("owner") or "the owner"
+    SHARED = cfg.get("backend") == "supabase"
+    set_project(None)
+
+
+def set_project(path):
+    """Shared ledger: this session's project is its repository's name (LEDGER_PROJECT overrides)."""
+    global PROJECT, FAMILY, DEFAULT_PROJECT
+    if not SHARED:
+        PROJECT, FAMILY, DEFAULT_PROJECT = None, None, "main"
+        return
+    PROJECT = os.environ.get("LEDGER_PROJECT") or project_for(path or os.getcwd())
+    FAMILY = family_for(PROJECT)
+    DEFAULT_PROJECT = PROJECT
+
+
+def project_for(path):
+    """The repository's name from its origin remote (the same on every machine and in the cloud), else the folder's."""
+    code, url = git(["remote", "get-url", "origin"], path)
+    name = re.split(r"[/:\\]", url.strip().rstrip("/"))[-1] if code == 0 and url.strip() else ""
+    if not name:
+        code, top = git(["rev-parse", "--show-toplevel"], path)
+        name = os.path.basename(top.rstrip("/\\")) if code == 0 and top else os.path.basename(os.path.abspath(path))
+    name = re.sub(r"\.git$", "", name).strip().lower()
+    return name if name and name != "all" else "main"
 
 
 def read_config():
@@ -177,7 +218,7 @@ CREATE TABLE IF NOT EXISTS events(ts TEXT NOT NULL, action TEXT NOT NULL, item T
 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT, updated TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(id UNINDEXED, title, body, quote, tags);
 """
-LOCAL_STATE = ("jsonl_hash",)  # state kept in the cache only, never written to ledger.jsonl
+LOCAL_STATE = ("jsonl_hash",)  # state kept in the cache only, never written to ledger.jsonl; so are keys "local_*"
 
 
 class LedgerFileError(Exception):
@@ -192,10 +233,14 @@ def file_hash(path):
         return ""
 
 
-def connect():
-    con = sqlite3.connect(DB)
+def connect(fresh=False):
+    """The cache, brought up to date: from ledger.jsonl, or (shared) from Supabase; fresh = always pull first."""
+    con = sqlite3.connect(DB, timeout=20)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    if SHARED:
+        shared_sync(con, fresh)
+        return con
     h = file_hash(JSONL)
     if h and get_state(con, "jsonl_hash") != h:  # the record changed outside this cache (a pull, a merge, a new clone)
         load_jsonl(con)
@@ -300,13 +345,211 @@ def write_jsonl(con):
             for r in con.execute("SELECT * FROM events ORDER BY rowid")]
     out += [json.dumps({"state": dict(r)}, ensure_ascii=False, sort_keys=True)
             for r in con.execute(f"SELECT * FROM state WHERE key NOT IN ({','.join('?' * len(LOCAL_STATE))}) "
-                                 "ORDER BY key", LOCAL_STATE)]
+                                 "AND key NOT LIKE 'local!_%' ESCAPE '!' ORDER BY key", LOCAL_STATE)]
     tmp = JSONL + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write("".join(s + "\n" for s in out))
     os.replace(tmp, JSONL)
     set_state(con, "jsonl_hash", file_hash(JSONL))
     con.commit()
+
+
+# ---------------------------------------------------------------- storage, shared: Supabase is the record, ledger.db a cache
+#
+# One record for all of the owner's sessions, local and cloud (supabase/schema.sql sets up the server). Each command
+# pulls the record into the cache (writes always; reads unless the last pull is under PULL_FRESH seconds old), works
+# on the cache as before, then pushes only what it changed: new items, the fields it edited, new links, events and
+# state. If Supabase can't be reached, the change waits in outbox.jsonl and is sent first next time.
+#
+# Credentials: LEDGER_SUPABASE_URL, LEDGER_SUPABASE_KEY (the project's publishable key, which opens nothing by itself)
+# and LEDGER_TOKEN, from the environment or from credentials.json beside config.json. With no token, the server reads
+# an x-ledger-token header, which a cloud environment's network secret can add without the session seeing it.
+
+PULL_FRESH = 20  # seconds; hook-start a and b, run back to back, share one pull
+TIMEOUT = 15  # seconds per request; hooks use HOOK_TIMEOUT
+HOOK_TIMEOUT = 6
+SNAP = None  # the cache as last pulled or pushed: what a command's changes are measured against
+
+
+class SharedError(Exception):
+    pass
+
+
+def creds():
+    """(url, key, token, where from), environment first, then credentials.json."""
+    try:
+        with open(os.path.join(LEDGER_DIR, "credentials.json"), encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    out, where = [], []
+    for env, k in (("LEDGER_SUPABASE_URL", "url"), ("LEDGER_SUPABASE_KEY", "key"), ("LEDGER_TOKEN", "token")):
+        v = os.environ.get(env) or saved.get(k) or ""
+        out.append(v)
+        where.append(f"{k}: " + ("environment" if os.environ.get(env) else "credentials.json" if v else "not set"))
+    return (*out, ", ".join(where))
+
+
+def http_rpc(fn, args, timeout):
+    """Call one of the ledger's two database functions over HTTPS."""
+    url, key, token, _ = creds()
+    if not url or not key:
+        raise SharedError("no Supabase URL or key (set LEDGER_SUPABASE_URL and LEDGER_SUPABASE_KEY, or run "
+                          "shared-setup --url URL --key KEY)")
+    if token:
+        args = dict(args, p_token=token)
+    headers = {"apikey": key, "Content-Type": "application/json"}
+    if not key.startswith("sb_"):  # an older anon key is a JWT and goes in Authorization too
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url.rstrip("/") + "/rest/v1/rpc/" + fn, method="POST", headers=headers,
+                                 data=json.dumps(args, ensure_ascii=False).encode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "null")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("message") or e.reason
+        except (ValueError, OSError, AttributeError):
+            msg = e.reason
+        raise SharedError(f"the shared ledger refused the request ({e.code}: {msg})") from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise SharedError(f"can't reach the shared ledger ({getattr(e, 'reason', e)})") from None
+
+
+RPC = http_rpc  # the tests swap in a fake server
+
+
+def is_local_key(k):
+    return k in LOCAL_STATE or k.startswith("local_")
+
+
+def snapshot(con):
+    return {"items": {r["id"]: dict(r) for r in con.execute("SELECT * FROM items")},
+            "links": {(r["src"], r["rel"], r["dst"]): dict(r) for r in con.execute("SELECT * FROM links")},
+            "state": {r["key"]: r["value"] for r in con.execute("SELECT * FROM state") if not is_local_key(r["key"])},
+            "ev": con.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]}
+
+
+def load_pulled(con, data):
+    with con:
+        for t in ("items", "links", "events", "fts"):  # events were sent when they were made; the server keeps them
+            con.execute(f"DELETE FROM {t}")
+        con.execute("DELETE FROM state WHERE key NOT LIKE 'local!_%' ESCAPE '!'")
+        for it in data.get("items") or []:
+            con.execute(f"INSERT INTO items({','.join(ITEM_COLS)}) VALUES({','.join('?' * len(ITEM_COLS))})",
+                        [it.get(c) if it.get(c) is not None else ("" if c != "priority" else 2) for c in ITEM_COLS])
+            reindex(con, it["id"])
+        for ln in data.get("links") or []:
+            con.execute("INSERT OR REPLACE INTO links VALUES(?,?,?,?,?)",
+                        (ln["src"], ln["rel"], ln["dst"], ln.get("note") or "", ln.get("created") or ""))
+        for st in data.get("state") or []:
+            con.execute("INSERT OR REPLACE INTO state VALUES(?,?,?)", (st["key"], st.get("value"), st.get("updated")))
+
+
+def pull(con):
+    load_pulled(con, RPC("ledger_pull", {}, TIMEOUT))
+    set_state(con, "local_pulled_ts", str(time.time()))
+    set_state(con, "local_pulled_at", now())
+    set_state(con, "local_problem", "")
+    con.commit()
+
+
+def shared_sync(con, fresh=False):
+    global SNAP
+    try:
+        if flush_outbox() and (fresh or time.time() - float(get_state(con, "local_pulled_ts") or 0) > PULL_FRESH):
+            pull(con)
+    except SharedError as e:
+        set_state(con, "local_problem", str(e))
+        con.commit()
+    SNAP = snapshot(con)
+
+
+def changes(con):
+    """What this command changed in the cache since SNAP, as one batch for ledger_push (None = nothing)."""
+    items = []
+    for r in con.execute("SELECT * FROM items ORDER BY rowid"):
+        d, old = dict(r), SNAP["items"].get(r["id"])
+        if old is None:
+            items.append(dict(d, _new=True))
+        else:
+            diff = {k: v for k, v in d.items() if old.get(k) != v}
+            if diff:
+                items.append(dict(diff, id=d["id"], updated=d["updated"]))
+    links = [dict(r) for r in con.execute("SELECT * FROM links")
+             if SNAP["links"].get((r["src"], r["rel"], r["dst"])) != dict(r)]
+    events = [dict(r) for r in con.execute("SELECT * FROM events WHERE rowid > ? ORDER BY rowid", (SNAP["ev"],))]
+    state = [dict(r) for r in con.execute("SELECT * FROM state")
+             if not is_local_key(r["key"]) and SNAP["state"].get(r["key"], object()) != r["value"]]
+    if not (items or links or events or state):
+        return None
+    return {"project": PROJECT, "items": items, "links": links, "events": events, "state": state}
+
+
+def rename_in(batch, renamed):
+    """Apply the server's renames ({old: new}) to a batch that was waiting in the outbox."""
+    r = lambda x: renamed.get(x, x)  # noqa: E731
+    for it in batch.get("items", []):
+        it["id"] = r(it["id"])
+    for ln in batch.get("links", []):
+        ln["src"], ln["dst"] = r(ln["src"]), r(ln["dst"])
+    for ev in batch.get("events", []):
+        ev["item"] = r(ev.get("item"))
+    for st in batch.get("state", []):
+        st["value"] = r(st.get("value"))
+    return batch
+
+
+def say_renamed(renamed):
+    for old, new in (renamed or {}).items():
+        print(f"ledger: another session had already used {old}, so the new item {old} is now {new}", file=sys.stderr)
+
+
+def flush_outbox():
+    """Send changes saved while the shared ledger was out of reach, oldest first. True when none are left."""
+    if not os.path.exists(OUTBOX):
+        return True
+    with open(OUTBOX, encoding="utf-8") as f:
+        waiting = [json.loads(s) for s in f.read().splitlines() if s.strip()]
+    renamed = {}
+    for i, batch in enumerate(waiting):
+        batch = rename_in(batch, renamed)
+        try:
+            res = RPC("ledger_push", {"p_batch": batch}, TIMEOUT) or {}
+        except SharedError as e:
+            with open(OUTBOX, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(json.dumps(b, ensure_ascii=False) + "\n" for b in waiting[i:]))
+            raise SharedError(f"{e}; {len(waiting) - i} change(s) wait in {OUTBOX}") from None
+        renamed.update(res.get("renamed") or {})
+        waiting[i] = batch
+    os.remove(OUTBOX)
+    say_renamed(renamed)
+    return True
+
+
+def shared_push(con):
+    global SNAP
+    batch = changes(con)
+    if not batch:
+        return
+    try:
+        res = RPC("ledger_push", {"p_batch": batch}, TIMEOUT) or {}
+    except SharedError as e:
+        with open(OUTBOX, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(batch, ensure_ascii=False) + "\n")
+        set_state(con, "local_problem", f"{e}; changes wait in {OUTBOX}")
+        con.commit()
+        print(f"ledger: {e}. The change is saved on this machine ({OUTBOX}) and will be sent next time.",
+              file=sys.stderr)
+        SNAP = snapshot(con)
+        return
+    if res.get("renamed"):
+        say_renamed(res["renamed"])
+        try:
+            pull(con)
+        except SharedError:
+            pass
+    SNAP = snapshot(con)
 
 
 # ---------------------------------------------------------------- small helpers
@@ -453,6 +696,11 @@ def set_state(con, key, value):
     con.execute("INSERT OR REPLACE INTO state VALUES(?,?,?)", (key, value, now()))
 
 
+def fk(key):
+    """The state key for this project's focus: the shared ledger keeps one focus per project."""
+    return f"{key}@{PROJECT}" if SHARED else key
+
+
 # ---------------------------------------------------------------- audit and brief
 
 def audit(con, projects=None):
@@ -495,9 +743,20 @@ NUM = "CAST(substr(id,2) AS INTEGER)"
 
 def make_brief(con, part=None, projects=None):
     """part None = everything (BRIEF.md, handoff); 'a' = state; 'b' = standing items. Each part fits one hook."""
+    if SHARED:
+        where = (f"the shared ledger (Supabase), one record for all of {OWNER}'s sessions, local and cloud. This "
+                 f"session's project is `{PROJECT}`; items marked `all` apply to every project. How to use it: "
+                 f"`{slash(os.path.join(HERE, 'LEDGER.md'))}` (read it once). {OWNER}'s view: `{HTML}`")
+        problem = get_state(con, "local_problem")
+        if problem:
+            where += (f".\n\n**SHARED LEDGER PROBLEM:** {problem}. This is the copy from "
+                      f"{get_state(con, 'local_pulled_at') or 'the last pull'}; new entries are kept on this machine "
+                      f"and sent when it's back. Tell {OWNER} if it persists")
+    else:
+        where = f"`{JSONL}` ({OWNER}'s view: `{HTML}`)"
     head = [f"# Ledger brief{' (' + part + ' of a/b)' if part else ''}, generated {now()}",
             "",
-            f"Source of truth for project state: `{JSONL}` ({OWNER}'s view: `{HTML}`). If a summary, "
+            f"Source of truth for project state: {where}. If a summary, "
             f"plan, handoff or memory note disagrees with the ledger, the ledger wins; if {OWNER}'s own words disagree "
             "with each other, ask. **Required:** before offering options, planning or starting a stage, or writing "
             f"a handoff, run `{tool_cmd()} check <topic>`. Record each new instruction, decision or answer from "
@@ -538,12 +797,12 @@ def make_brief(con, part=None, projects=None):
     live = "('open','active','in-progress','waiting','blocked','proposed')"
     order = f" ORDER BY priority, {NUM}"
     if part in (None, "a"):
-        f = get_state(con, "focus")
+        f = get_state(con, fk("focus"))
         out.append("## Current focus")
         if f and f != "none":
             r = con.execute("SELECT * FROM items WHERE id=?", (f,)).fetchone()
-            fq = get_state(con, "focus_quote")
-            out.append(f"- {f} {r['title'] if r else '(missing item)'} [set {get_state(con, 'focus_set')}]"
+            fq = get_state(con, fk("focus_quote"))
+            out.append(f"- {f} {r['title'] if r else '(missing item)'} [set {get_state(con, fk('focus_set'))}]"
                        + (f'\n  {OWNER}: "{fq[:300]}"' if fq else ""))
         else:
             out.append(f"- None chosen: {OWNER} hasn't picked the next step. Don't start a new work stream on your "
@@ -589,7 +848,10 @@ def make_brief(con, part=None, projects=None):
 # ---------------------------------------------------------------- exports
 
 def export(con):
-    write_jsonl(con)
+    if SHARED:
+        shared_push(con)
+    else:
+        write_jsonl(con)
     with open(BRIEF, "w", encoding="utf-8") as f:
         f.write(make_brief(con))
     items = [dict(r) for r in con.execute("SELECT * FROM items ORDER BY id")]
@@ -634,7 +896,7 @@ def write_html(con, items, links):
     waiting = sorted((i for i in items if i["owner"] == "owner" and i["status"] in LIVE),
                      key=lambda i: (i["priority"], i["created"]))
     secs = []
-    fid = get_state(con, "focus")
+    fid = get_state(con, fk("focus"))
     if fid and fid != "none" and fid in by:
         secs.append("<h2>Current focus</h2>" + card(by[fid], anchor=False))
     if waiting:
@@ -655,7 +917,8 @@ def write_html(con, items, links):
                 f"closed / superseded ({len(old)})"
             s += f"<details><summary>{label}</summary>{''.join(card(i) for i in old)}</details>"
         secs.append(s)
-    name = os.path.basename(WORKSPACE) or "Project"
+    name = f"{OWNER}'s shared" if SHARED else (os.path.basename(WORKSPACE) or "Project")
+    src = f"the shared ledger (last pulled {get_state(con, 'local_pulled_at')})" if SHARED else JSONL
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(name)} ledger</title><style>
 :root{{--bg:#fafaf8;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#e2e1dc;--acc:#2f5d8a;--warn:#9a3b1c}}
@@ -668,7 +931,7 @@ small{{color:var(--mut);font-weight:400}} input{{width:100%;box-sizing:border-bo
 .st{{color:var(--acc);font-weight:600}} blockquote{{margin:6px 0;padding-left:10px;border-left:3px solid var(--acc)}}
 .src{{font-size:12px;color:var(--mut)}} .lk{{font-size:12.5px;margin:4px 0 0;padding-left:18px}} a{{color:var(--acc)}}
 .warn li{{color:var(--warn)}} .s-superseded,.s-rejected{{opacity:.6}} p{{margin:5px 0}}
-</style></head><body><h1>{e(name)} ledger</h1><div class="src">Generated {e(now())} from {e(JSONL)}.
+</style></head><body><h1>{e(name)} ledger</h1><div class="src">Generated {e(now())} from {e(src)}.
 Claude writes it; tell Claude in chat to change anything.</div>
 <p><input id="f" placeholder="Filter: type a word, an ID (D12) or a tag"></p>{''.join(secs)}
 <script>document.getElementById('f').addEventListener('input',function(){{var v=this.value.toLowerCase();
@@ -755,6 +1018,8 @@ def cmd_check(con, topic):
     always = con.execute("SELECT * FROM items WHERE kind IN ('goal','conflict') AND status IN ('active','open')")
     for r in always:
         hits.setdefault(r["id"], r)
+    if FAMILY:
+        hits = {k: r for k, r in hits.items() if r["project"] in FAMILY}
     order = ["goal", "conflict", "rule", "ask", "decision", "question", "promise", "task", "defect", "lesson", "fact",
              "ref", "note"]
     print(f"# check: {text}\n({OWNER}'s words outrank my plans. Resolve any conflict below before acting.)")
@@ -779,15 +1044,17 @@ def cmd_list(con, args):
     if not op.get("all") and not op.get("status"):
         sql += f" AND status IN ({','.join('?' * len(LIVE))})"
         a.extend(LIVE)
+    if FAMILY and not op.get("project") and not op.get("all-projects"):
+        sql += pf(FAMILY)
     for r in con.execute(sql + " ORDER BY kind, priority, id", a):
         print(line(r, 120))
 
 
 def cmd_handoff(con):
     print(f"## Handoff from the ledger ({now()})\n")
-    print(make_brief(con).split("\n", 1)[1])
+    print(make_brief(con, None, FAMILY).split("\n", 1)[1])
     print("## Recently changed (48 h)")
-    for r in con.execute("SELECT * FROM items ORDER BY updated DESC LIMIT 25"):
+    for r in con.execute("SELECT * FROM items WHERE 1=1" + pf(FAMILY) + " ORDER BY updated DESC LIMIT 25"):
         if days_since(r["updated"]) <= 2:
             print(line(r, 100))
 
@@ -854,6 +1121,8 @@ def match_prompt(con, prompt, projects=None):
 
 def in_scope(hook_input):
     """True when the session works in this ledger's repository (the folder above .ledger) or a folder inside it."""
+    if SHARED:
+        return True
     cwd = os.path.normcase(os.path.abspath(hook_input.get("cwd") or os.getcwd()))
     ws = os.path.normcase(os.path.abspath(WORKSPACE))
     return cwd == ws or cwd.startswith(ws.rstrip(os.sep) + os.sep)
@@ -953,13 +1222,13 @@ def cmd_override(con, args):
 def cmd_focus(con, args):
     pos, op = parse_opts(args)
     if not pos:
-        print(get_state(con, "focus") or "none")
+        print(get_state(con, fk("focus")) or "none")
         return
     if pos[0] != "none":
         get(con, pos[0])
-    set_state(con, "focus", pos[0])
-    set_state(con, "focus_quote", op.get("quote", ""))
-    set_state(con, "focus_set", now())
+    set_state(con, fk("focus"), pos[0])
+    set_state(con, fk("focus_quote"), op.get("quote", ""))
+    set_state(con, fk("focus_set"), now())
     log(con, "focus", pos[0], {"quote": op.get("quote", "")})
     con.commit()
     print(f"focus: {pos[0]}")
@@ -1044,6 +1313,10 @@ def is_ledger_hook(entry):
                for h in entry.get("hooks", []))
 
 
+def is_cloud_hook(entry):
+    return any("CLAUDE_CODE_REMOTE" in h.get("command", "") for h in entry.get("hooks", []))
+
+
 def cmd_init(args, dir_arg=None):
     _, op = parse_opts(args)
     if op.get("root"):
@@ -1108,7 +1381,8 @@ def cmd_init(args, dir_arg=None):
     shared = os.path.join(sdir, "settings.json")
     try:
         with open(shared, encoding="utf-8") as f:
-            if any(is_ledger_hook(x) for v in json.load(f).get("hooks", {}).values() for x in v):
+            if any(is_ledger_hook(x) and not is_cloud_hook(x) for v in json.load(f).get("hooks", {}).values()
+                   for x in v):
                 done.append(f"WARNING: {shared} has ledger hooks too; remove them there or they'll run twice")
     except (OSError, ValueError, AttributeError):
         pass
@@ -1137,6 +1411,154 @@ def cmd_init(args, dir_arg=None):
     print("ledger ready in " + root + "\n" + "\n".join(f"- {x}" for x in done))
 
 
+# ---------------------------------------------------------------- the shared ledger: setup
+
+def shared_home():
+    return os.environ.get("LEDGER_HOME") or os.path.join(os.path.expanduser("~"), DIRNAME)
+
+
+def claude_settings():
+    return os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"),
+                        "settings.json")
+
+
+def write_private(path, text):
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def install_hooks(sfile, base, wrap=lambda c: c):
+    """Put the three ledger hooks into a Claude Code settings file, replacing earlier ledger hooks there."""
+    try:
+        with open(sfile, encoding="utf-8") as f:
+            settings = json.load(f)
+    except OSError:
+        settings = {}
+    except ValueError:
+        sys.exit(f"{sfile} isn't valid JSON; fix it and run this again")
+    ours = {
+        "SessionStart": {"matcher": "startup|resume|compact|clear", "hooks": [
+            {"type": "command", "command": wrap(f"{base} hook-start a"), "timeout": 30},
+            {"type": "command", "command": wrap(f"{base} hook-start b"), "timeout": 30}]},
+        "UserPromptSubmit": {"hooks": [{"type": "command", "command": wrap(f"{base} hook-prompt"), "timeout": 15}]},
+        "PreCompact": {"matcher": "manual|auto", "hooks": [
+            {"type": "command", "command": wrap(f"{base} hook-precompact"), "timeout": 30}]},
+    }
+    hooks = settings.setdefault("hooks", {})
+    for ev, entry in ours.items():
+        hooks[ev] = [x for x in hooks.get(ev, []) if not is_ledger_hook(x)] + [entry]
+    os.makedirs(os.path.dirname(sfile), exist_ok=True)
+    with open(sfile, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+
+
+def cmd_shared_setup(args):
+    """Use the shared ledger on this machine: config in ~/.ledger, hooks for every session in ~/.claude."""
+    _, op = parse_opts(args)
+    d = shared_home()
+    os.makedirs(d, exist_ok=True)
+    use_dir(d)
+    cfg = read_config()
+    _, gname = git(["config", "user.name"], os.getcwd())
+    cfg["owner"] = op.get("owner") or cfg.get("owner") or (gname.split() or ["the owner"])[0]
+    cfg["backend"] = "supabase"
+    write_private(CONFIG, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    write_private(os.path.join(d, ".gitignore"), "*\n")  # nothing here belongs in any repository
+    use_dir(d)
+    done = [f"owner: {OWNER}; config in {CONFIG}"]
+    if op.get("url") or op.get("key"):
+        cpath = os.path.join(d, "credentials.json")
+        try:
+            with open(cpath, encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = {}
+        saved.update({k: op[k] for k in ("url", "key") if isinstance(op.get(k), str)})
+        write_private(cpath, json.dumps(saved, indent=2) + "\n")
+        done.append(f"saved the URL and key in {cpath}")
+    url, key, token, where = creds()
+    done.append(f"credentials: {where}" + ("" if token else " (no token: the server must get it from an "
+                                                               "x-ledger-token header, as a cloud network secret adds)"))
+    if op.get("no-check"):
+        pass
+    elif not (url and key):
+        done.append("not connected yet: set the URL and key (see README, 'Shared ledger')")
+    else:
+        try:
+            data = RPC("ledger_pull", {}, TIMEOUT)
+            done.append(f"connected as token '{data.get('by')}': {len(data.get('items') or [])} items in the "
+                        "shared ledger")
+        except SharedError as e:
+            done.append(f"NOT connected: {e}")
+    if not op.get("no-hooks"):
+        install_hooks(claude_settings(), tool_cmd())
+        done.append(f"hooks for every Claude Code session on this machine in {claude_settings()}")
+    print("shared ledger set up\n" + "\n".join(f"- {x}" for x in done))
+
+
+CLOUD_TOOL = "~/.ledger/tool/ledger.py"
+
+
+def cmd_shared_repo(args):
+    """Add the shared ledger's hooks to this repository's committed .claude/settings.json, for cloud sessions only.
+    Locally they do nothing (the machine's own hooks from shared-setup run instead)."""
+    _, op = parse_opts(args)
+    code, top = git(["rev-parse", "--show-toplevel"], os.getcwd())
+    root = os.path.abspath(op["root"]) if isinstance(op.get("root"), str) else (top if code == 0 and top else None)
+    if not root:
+        sys.exit("run this inside a git repository, or pass --root PATH")
+    guard = f'[ "$CLAUDE_CODE_REMOTE" = "true" ] && [ -f {CLOUD_TOOL} ] && python3 {CLOUD_TOOL} --dir ~/.ledger'
+    install_hooks(os.path.join(root, ".claude", "settings.json"), guard, wrap=lambda c: f"{c} || true")
+    print(f"cloud hooks in {os.path.join(root, '.claude', 'settings.json')}; commit that file. They run only in "
+          "cloud sessions whose environment installs the tool (README, 'Shared ledger').")
+
+
+def cmd_new_token(args):
+    """Make a token for one machine or environment. Prints the SQL that registers its hash, never the token."""
+    pos, op = parse_opts(args)
+    if not pos or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", pos[0]):
+        sys.exit("usage: new-token LABEL [--save]   (LABEL: letters, digits, - _ .)")
+    label, d = pos[0], shared_home()
+    os.makedirs(d, exist_ok=True)
+    tok = "lt_" + secrets.token_urlsafe(32)
+    if op.get("save"):
+        path = os.path.join(d, "credentials.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = {}
+        saved["token"] = tok
+        write_private(path, json.dumps(saved, indent=2) + "\n")
+        where = f"saved as this machine's token in {path}"
+    else:
+        path = os.path.join(d, f"token-{label}.txt")
+        write_private(path, tok + "\n")
+        where = f"written to {path}: copy it where it's needed, then delete that file"
+    h = hashlib.sha256(tok.encode("utf-8")).hexdigest()
+    print(f"token '{label}' {where}.\nRegister it by running this SQL in the Supabase project (it holds only the "
+          f"hash):\n  insert into ledger.tokens(label, hash) values ('{label}', '{h}')\n"
+          "  on conflict (label) do update set hash = excluded.hash, revoked_at = null;")
+
+
+def cmd_shared_status(con):
+    url, key, token, where = creds()
+    pulled = get_state(con, "local_pulled_at") or "never"
+    n = con.execute("SELECT project, COUNT(*) n FROM items GROUP BY project ORDER BY project").fetchall()
+    waiting = 0
+    if os.path.exists(OUTBOX):
+        with open(OUTBOX, encoding="utf-8") as f:
+            waiting = sum(1 for s in f if s.strip())
+    print(f"shared ledger, owner {OWNER}; this folder's project: {PROJECT}\n"
+          f"credentials: {where}\nlast pull: {pulled}\n"
+          f"problem: {get_state(con, 'local_problem') or 'none'}\nchanges waiting to be sent: {waiting}\n"
+          "items by project: " + (", ".join(f"{r['project']} {r['n']}" for r in n) or "none"))
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1150,8 +1572,10 @@ def main():
         print(__doc__)
         return
     c, rest = a[0], a[1:]
-    if c == "init":
-        cmd_init(rest, dir_arg)
+    standalone = {"init": lambda: cmd_init(rest, dir_arg), "shared-setup": lambda: cmd_shared_setup(rest),
+                  "shared-repo": lambda: cmd_shared_repo(rest), "new-token": lambda: cmd_new_token(rest)}
+    if c in standalone:
+        standalone[c]()
         return
     found = dir_arg or find_dir()
     if not found or not os.path.isdir(found):
@@ -1160,10 +1584,16 @@ def main():
         sys.exit("no .ledger folder found: run `ledger.py init` from the repository root, or pass --dir")
     use_dir(found)
     hin = read_hook_input() if c.startswith("hook-") else {}
+    if SHARED and hin.get("cwd"):
+        set_project(hin["cwd"])
     if c.startswith("hook-") and not (in_scope(hin) or "--force" in rest):
         return
+    write = c in ("add", "set", "link", "override", "focus", "import")
+    if c.startswith("hook-"):
+        global TIMEOUT
+        TIMEOUT = HOOK_TIMEOUT
     try:
-        con = connect()
+        con = connect(fresh=write)
     except LedgerFileError as err:
         if c == "hook-start" and (rest[:1] or ["a"])[0] == "a":
             emit("SessionStart", f"LEDGER FILE PROBLEM: {err}. The ledger can't load until this is fixed; tell "
@@ -1172,7 +1602,6 @@ def main():
         if c.startswith("hook-"):
             return
         sys.exit(f"ledger: {err}")
-    write = c in ("add", "set", "link", "override", "focus", "import")
     if c == "add":
         cmd_add(con, rest)
     elif c == "set":
@@ -1195,7 +1624,7 @@ def main():
     elif c == "brief":
         export(con)
         _, bo = parse_opts(rest)
-        print(make_brief(con, None, family_for(bo.get("project"))))
+        print(make_brief(con, None, family_for(bo.get("project")) or FAMILY))
     elif c == "override":
         cmd_override(con, rest)
     elif c == "focus":
@@ -1204,14 +1633,14 @@ def main():
         cmd_import(con, rest)
     elif c == "match":
         mp, mo = parse_opts(rest)
-        print(prompt_report(con, " ".join(mp), family_for(mo.get("project"))) or "(nothing flagged)")
+        print(prompt_report(con, " ".join(mp), family_for(mo.get("project")) or FAMILY) or "(nothing flagged)")
     elif c == "hook-start":
         part = rest[0] if rest and rest[0] in ("a", "b") else "a"
         if part == "a":
             export(con)
-        emit("SessionStart", make_brief(con, part))
+        emit("SessionStart", make_brief(con, part, FAMILY))
     elif c == "hook-prompt":
-        rep = prompt_report(con, hin.get("prompt", ""))
+        rep = prompt_report(con, hin.get("prompt", ""), FAMILY)
         if rep:
             emit("UserPromptSubmit", rep)
     elif c == "hook-precompact":
@@ -1221,6 +1650,8 @@ def main():
     elif c == "export":
         export(con)
         print("exported")
+    elif c == "shared-status":
+        cmd_shared_status(con)
     else:
         sys.exit(f"unknown command {c}")
     if write:

@@ -178,7 +178,83 @@ there without committing it, run `init --private`.
 | `match "text"` | What the override check would flag for a message (for testing) |
 | `brief`, `handoff`, `audit` | Read the state |
 
-## Moving from a shared ledger
+## Shared ledger: one record for every session, local and cloud
+
+A repository's ledger only reaches sessions that have that repository. A Claude Code cloud session sees only the
+repository it was started on, so it can't see rules you set while working somewhere else. The shared ledger keeps one
+record in a Supabase database (a hosted Postgres) instead. Every session on your machine, and every cloud session you
+set up for it, reads and writes the same record:
+
+- each session sees the items for its own project (the repository's name) plus anything marked `all`;
+- items, edits and links go straight to the database; the local `ledger.db` is just a cache;
+- if the database can't be reached, the session works from the last copy, says so in the brief, and sends what it
+  recorded when the connection is back.
+
+### Who can read it
+
+Your words are personal data, so access is closed by default:
+
+- The tables sit in a database schema that Supabase's public API doesn't serve, with row-level security on and no
+  policies. The project's public key opens nothing by itself.
+- The only way in is two database functions, `ledger_pull` and `ledger_push`. Each one first checks a **ledger
+  token**: a random 43-character secret. The database stores only its SHA-256 hash.
+- Give each machine or cloud environment its own token, so you can cut one off (`update ledger.tokens set revoked_at
+  = now() where label = '...'`) without touching the others.
+- In a cloud session the token doesn't have to be in the session at all: a cloud environment's *network secret* adds
+  it to each request as an `x-ledger-token` header, outside the session.
+- Nothing about the database goes into a repository. The URL, key and token live in environment variables or in
+  `~/.ledger/credentials.json`, outside every repository.
+
+`test_shared_live.py` checks this against a real project: with only the public key, both functions refuse, the
+tables can't be read, and a wrong token is refused.
+
+### Set it up
+
+1. Make a Supabase project and run [`supabase/schema.sql`](supabase/schema.sql) in its SQL editor.
+2. Point this machine at it and make a token:
+
+   ```bash
+   python tools/ledger/ledger.py shared-setup --owner "Your name" --url https://YOURPROJECT.supabase.co --key sb_publishable_... --no-hooks
+   python tools/ledger/ledger.py new-token laptop --save
+   ```
+
+   `new-token` prints a line of SQL holding the token's hash. Run it in the SQL editor. The token itself is saved in
+   `~/.ledger/credentials.json` and never printed.
+3. Run `python tools/ledger/ledger.py shared-setup` again, without `--no-hooks`. It checks the connection and adds
+   the hooks to `~/.claude/settings.json`, so **every** Claude Code session on this machine gets the brief for its
+   project.
+
+### Cloud sessions
+
+Cloud sessions don't read `~/.claude/settings.json`, so they need three things:
+
+1. **The cloud environment** (claude.ai/code → environment settings):
+   - Environment variables: `LEDGER_SUPABASE_URL=https://YOURPROJECT.supabase.co`,
+     `LEDGER_SUPABASE_KEY=sb_publishable_...`, and `TZ=` your time zone (for example `America/Los_Angeles`), so the
+     times cloud sessions record match yours.
+   - A network secret: allowed website `YOURPROJECT.supabase.co`, header name `x-ledger-token`, no prefix, value: a
+     token made with `new-token cloud` (it's written to `~/.ledger/token-cloud.txt`; delete that file afterwards).
+     This also lets the session reach the database.
+   - A setup script that installs the tool:
+
+     ```bash
+     mkdir -p ~/.ledger/tool
+     curl -fsSL https://raw.githubusercontent.com/joshhickson/ledger/main/ledger.py -o ~/.ledger/tool/ledger.py
+     curl -fsSL https://raw.githubusercontent.com/joshhickson/ledger/main/LEDGER.md -o ~/.ledger/tool/LEDGER.md
+     python3 ~/.ledger/tool/ledger.py shared-setup --owner "Your name" --no-hooks --no-check
+     ```
+
+2. **Each repository** you start cloud sessions on gets the hooks in its committed `.claude/settings.json`:
+
+   ```bash
+   python tools/ledger/ledger.py shared-repo
+   git add .claude/settings.json && git commit -m "Shared ledger hooks for cloud sessions"
+   ```
+
+   They only run when `CLAUDE_CODE_REMOTE` is `true` and the tool is installed, and they never fail a session. On
+   your own machine they do nothing, so the machine-wide hooks don't run twice. The file holds no secrets.
+
+## Moving from an older ledger
 
 `import OLD.db --project NAME` copies one project's items (and items marked `all`) from an older ledger database into
 an empty per-repository ledger. The old database is opened read-only. `--as NAME` names the person the old ledger
@@ -188,6 +264,7 @@ treated as owner, so their items become the new owner's. This command hasn't bee
 
 ```bash
 python tools/ledger/test_ledger.py
+python tools/ledger/test_shared.py
 ```
 
 The tests use throwaway folders next to the tool, including a real git merge from two branches, and never open a
