@@ -1,0 +1,45 @@
+
+  Switching the recipe pages to React would also affect:
+  - [1mG1, your goal for the site.[0m You said [3m"I want a recipe site that loads instantly on a phone, even on a bad
+[0m    [3mconnection."[0m A client-side React bundle adds JavaScript that has to download before the page shows, which
+    works against that. React that builds the pages to static HTML ahead of time (using a static site
+    generator) avoids most of the cost.
+  - [1mT1, the recipe page template.[0m This is what we're working on now, so its approach would change.
+  - [1mD2, one Markdown file per recipe.[0m This still works with React.
+
+  How do you want to handle it?
+  1. [1mChange it for good:[0m React replaces D1 everywhere.
+  2. [1mOne-time exception:[0m use React only for the recipe pages and keep D1 for the rest of the site.
+  3. [1mKeep D1:[0m stay with plain HTML and CSS.
+
+  If you choose React, do you want it built into static pages ahead of time, or running in the browser? I'll
+  record your answer in the ledger and then update T1.
+
+[38;5;246m✻[39m [38;5;246mBaked for 8s · done 7:29 AM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mchange it for good, built to static pages ahead of time[39m
+[49m
+  [38;5;246mRan [1m2[0m[38;5;246m shell commands [39m
+
+[38;5;231m●[39m I've recorded it. [1mD4[0m now replaces D1: [3mReact for the recipe pages, pre-rendered to static HTML at build time[0m,
+  with your words quoted. The ledger didn't list anything else that depends on D1. The repository has no site
+  code yet, so nothing needs rewriting. T1 (the recipe page template) will just start in React.
+
+  Before I build T1, one choice is yours: which tool turns the React pages into static HTML.
+
+  1. [1mAstro with React components (my recommendation).[0m It ships no JavaScript to the browser unless a component
+     needs it, which fits your goal of loading instantly on a bad connection. It also reads Markdown recipe
+     files directly, which fits D2.
+  2. [1mNext.js static export.[0m It's the best-known option, but every page carries React's runtime (about 40+ KB
+     of JavaScript), even when nothing on the page is interactive.
+  3. [1mVite with a small custom pre-render script.[0m This adds the fewest tools, but we'd write and maintain the
+     Markdown handling and page generation ourselves.
+
+  Which one do you want?
+
+[38;5;246m✻[39m [38;5;246mCrunched for 11s · done 7:31 AM[39m
+
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mgo with Astro[0m
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · ? for shortcuts[39m
