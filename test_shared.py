@@ -176,6 +176,13 @@ try:
     a = context(run(*B, "hook-start", "a", stdin={"cwd": tmp}))
     check("each project keeps its own focus", "None chosen" in a and "R2" not in a.split("## Current focus")[1][:200], a)
     check("the brief mentions the other projects", "shed (" in a, a)
+    os.environ["LEDGER_PROJECT"] = "shed"
+    run(*A, "add", "ref", "Shed plans: GitHub sam/shed, branch plans -> PLANS.md")
+    os.environ["LEDGER_PROJECT"] = "garden"
+    run(*A, "add", "ref", "Garden report: GitHub sam/garden, branch analysis -> REPORT.md", "--basis", "my-call")
+    a = context(run(*B, "hook-start", "a", stdin={"cwd": tmp}))
+    check("the brief names this project's pointers to earlier work, not other projects'",
+          "Read first" in a and "REPORT.md" in a and "PLANS.md" not in a, a)
     check("check stays in the project", "Shed paint" not in run(*B, "check", "paint", "green"))
     check("list stays in the project unless asked", "Shed paint" not in run(*B, "list")
           and "Shed paint" in run(*B, "list", "--all-projects"))

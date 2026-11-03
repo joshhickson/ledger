@@ -812,6 +812,9 @@ def make_brief(con, part=None, projects=None):
         out.append(f"- Side requests are fine ({OWNER} is in charge), but say they're side requests, record them as "
                    "their own items, and come back to the focus. Ideas of mine become `proposed` tasks, not work.")
         out.append("")
+        if SHARED:  # where earlier sessions left this project's reports: a cloud session can't find them otherwise
+            section("Read first: where earlier work is", "SELECT * FROM items WHERE kind='ref' AND status IN "
+                                                         "('open','active')" + order)
         section("Open conflicts", "SELECT * FROM items WHERE kind='conflict' AND status IN ('open','active')" + order)
         section(f"Waiting on {OWNER} (age)", f"SELECT * FROM items WHERE owner='owner' AND status IN {live} "
                                              "ORDER BY priority, created", age=True)
