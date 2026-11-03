@@ -136,7 +136,7 @@ begin
   for ev in select * from jsonb_array_elements(coalesce(p_batch -> 'events', '[]')) loop
     insert into ledger.events(ts, action, item, detail, project, pushed_by)
     values (ev ->> 'ts', ev ->> 'action', coalesce(renamed ->> (ev ->> 'item'), ev ->> 'item'), ev ->> 'detail',
-            p_batch ->> 'project', caller);
+            coalesce(ev ->> 'project', p_batch ->> 'project'), caller);
     n_events := n_events + 1;
   end loop;
   for st in select * from jsonb_array_elements(coalesce(p_batch -> 'state', '[]')) loop

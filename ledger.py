@@ -478,7 +478,9 @@ def changes(con):
                 items.append(dict(diff, id=d["id"], updated=d["updated"]))
     links = [dict(r) for r in con.execute("SELECT * FROM links")
              if SNAP["links"].get((r["src"], r["rel"], r["dst"])) != dict(r)]
-    events = [dict(r) for r in con.execute("SELECT * FROM events WHERE rowid > ? ORDER BY rowid", (SNAP["ev"],))]
+    events = [dict(r, project=r["project"] or PROJECT) for r in con.execute(
+        "SELECT e.*, i.project FROM events e LEFT JOIN items i ON i.id = e.item WHERE e.rowid > ? ORDER BY e.rowid",
+        (SNAP["ev"],))]  # each event is filed under its item's project
     state = [dict(r) for r in con.execute("SELECT * FROM state")
              if not is_local_key(r["key"]) and SNAP["state"].get(r["key"], object()) != r["value"]]
     if not (items or links or events or state):

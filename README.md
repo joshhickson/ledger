@@ -12,11 +12,17 @@ it doesn't record who proposed which idea.
 
 ## Status, read this first
 
-- **Tests:** the 55 checks in `test_ledger.py` pass (Python 3.13, about 1.3 seconds).
+- **Tests:** the 55 checks in `test_ledger.py` pass (Python 3.13, about 1.3 seconds). The shared ledger adds 40
+  checks in `test_shared.py` (no network: a stand-in plays the database) and 10 in `test_shared_live.py` against a
+  real Supabase project; all pass (Python 3.10 on Windows).
 - **Real Claude Code sessions:** until 2 November 2026 this published version had never run in a real Claude Code
   session. On that day it was run in short test sessions only (Claude Code 2.1.316: five headless runs and one
   interactive session) on a made-up sample record, in a throwaway container. The hooks fired each time.
   [`showcase/demo/`](showcase/demo/) has the transcripts and screenshots.
+- **Shared ledger, 2 November 2026:** one headless Claude Code session on Windows (2.1.296) and one cloud session
+  were run against a real Supabase project. Both got the brief from the database at session start. The cloud session
+  read an item recorded on the Windows machine and wrote a note that the Windows machine then read. The cloud
+  session's token was added by the cloud environment's network secret and never reached the session.
 - **Day-to-day use:** none yet for this version. The owner's daily use was of an earlier, multi-project version that
   isn't published here.
 
@@ -42,6 +48,25 @@ it doesn't record who proposed which idea.
 - **Small things:** `add --created` accepts any text without checking it's a date in the tool's format
   (`YYYY-MM-DD HH:MM`); the note `init` adds to CLAUDE.md says `python`, which some systems call `python3`.
 - **Privacy:** the ledger keeps your words verbatim. In a public repository anyone can read them; use `init --private`.
+
+Shared ledger only:
+
+- **Tried once each.** One local and one cloud session, a few minutes each, on test items. Not tried: the per-message
+  override check or a compaction in a cloud session, two sessions writing at the same moment for real (only
+  simulated), a long outage, and macOS or Linux machines.
+- **Every hook waits for the network.** Each session start and each message you send pulls the record from Supabase:
+  about 0.2 seconds in the tests. If Supabase is slow or down, a hook waits up to 6 seconds, then uses the last copy.
+- **One record for everything.** Item IDs are shared across all projects, so a new repository's first rule may be
+  R14. A session sees its own project plus `all`; the brief only counts the items of other projects.
+- **Last edit wins, field by field.** If two sessions change the same field of the same item, the later one wins with
+  no warning.
+- **Repositories need a committed file for cloud sessions.** `shared-repo` writes the hooks into
+  `.claude/settings.json`. The file holds no secrets, but in a public repository it shows that you use this tool.
+- **The cloud copy of the tool is fixed at the session's start** (the setup script downloads it, and cloud
+  environments cache the script's result). After the tool changes, the cache may keep the old copy for a while.
+- **Supabase's free plan pauses a project after a week without use.** Sessions then report a "SHARED LEDGER PROBLEM"
+  until you restore the project in the Supabase dashboard.
+- **Moving an existing per-repository ledger into the shared one** isn't built yet.
 
 ## Try it in five minutes
 
@@ -238,10 +263,11 @@ Cloud sessions don't read `~/.claude/settings.json`, so they need three things:
    - A setup script that installs the tool:
 
      ```bash
-     mkdir -p ~/.ledger/tool
-     curl -fsSL https://raw.githubusercontent.com/joshhickson/ledger/main/ledger.py -o ~/.ledger/tool/ledger.py
-     curl -fsSL https://raw.githubusercontent.com/joshhickson/ledger/main/LEDGER.md -o ~/.ledger/tool/LEDGER.md
-     python3 ~/.ledger/tool/ledger.py shared-setup --owner "Your name" --no-hooks --no-check
+     ( mkdir -p ~/.ledger/tool \
+       && curl -fsSL https://raw.githubusercontent.com/joshhickson/ledger/main/ledger.py -o ~/.ledger/tool/ledger.py \
+       && curl -fsSL https://raw.githubusercontent.com/joshhickson/ledger/main/LEDGER.md -o ~/.ledger/tool/LEDGER.md \
+       && python3 ~/.ledger/tool/ledger.py shared-setup --owner "Your name" --no-hooks --no-check ) \
+       || echo "shared ledger: install failed; this session runs without it"
      ```
 
 2. **Each repository** you start cloud sessions on gets the hooks in its committed `.claude/settings.json`:

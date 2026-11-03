@@ -67,7 +67,8 @@ class Server:
             ln = dict(ln, src=renamed.get(ln["src"], ln["src"]), dst=renamed.get(ln["dst"], ln["dst"]))
             self.links[(ln["src"], ln["rel"], ln["dst"])] = ln
         for ev in b.get("events", []):
-            self.events.append(dict(ev, item=renamed.get(ev.get("item"), ev.get("item")), project=b.get("project")))
+            self.events.append(dict(ev, item=renamed.get(ev.get("item"), ev.get("item")),
+                                    project=ev.get("project") or b.get("project")))
         for st in b.get("state", []):
             self.state[st["key"]] = dict(st, value=renamed.get(st.get("value"), st.get("value")))
         return {"renamed": renamed, "missing": missing, "by": "test"}
@@ -165,6 +166,9 @@ try:
     run(*A, "add", "rule", "Ask before buying anything", "--quote", "ask me before you buy anything",
         "--project", "all", "--tags", "buy,money")
     run(*A, "focus", "R2", "--quote", "the shed first")
+    check("an event is filed under its item's project, not the session's",
+          [e["project"] for e in srv.events if e["item"] == "R3" and e["action"] == "add"] == ["all"],
+          [e for e in srv.events if e["item"] == "R3"])
     os.environ["LEDGER_PROJECT"] = "garden"
     b = context(run(*B, "hook-start", "b", stdin={"cwd": tmp}))
     check("a garden session sees garden items and 'all' items, not the shed's",
