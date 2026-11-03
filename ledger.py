@@ -32,7 +32,7 @@ Usage:  python <tool>/ledger.py [--dir <repo>/.ledger] <command>
   override ID "new title" --quote "the owner's words" [--source S] [--once] [--tags T]
                               The owner changes a standing item: the new item supersedes ID (or, with --once, a
                               one-time exception is noted and ID stays in force). Prints what depends on ID, to review.
-  focus ID|none [--quote Q]   set the current focus (what the owner chose to work on); shown at the top of the brief
+  focus ID|none [--quote Q] [--project P]   set the current focus (what the owner chose to work on); shown at the top of the brief
   set ID key=value ...        change fields (status, owner, priority, tags, body, quote, source, basis, title, project)
   link SRC REL DST [note]     REL: serves blocks depends_on supersedes conflicts about evidence resolves
   show ID                     one item with all its links
@@ -698,9 +698,20 @@ def set_state(con, key, value):
     con.execute("INSERT OR REPLACE INTO state VALUES(?,?,?)", (key, value, now()))
 
 
-def fk(key):
-    """The state key for this project's focus: the shared ledger keeps one focus per project."""
-    return f"{key}@{PROJECT}" if SHARED else key
+def fk(key, project=None):
+    """The state key for a project's focus: the shared ledger keeps one focus per project ("all" = every project
+    without its own)."""
+    return f"{key}@{project or PROJECT}" if SHARED else key
+
+
+def current_focus(con):
+    """(item ID or "", the project whose focus it is): this project's own focus, else the one set on "all"."""
+    f = get_state(con, fk("focus"))
+    if SHARED and (not f or f == "none") and PROJECT != "all":
+        g = get_state(con, fk("focus", "all"))
+        if g and g != "none":
+            return g, "all"
+    return ("" if f == "none" else f or ""), PROJECT
 
 
 # ---------------------------------------------------------------- audit and brief
@@ -768,6 +779,7 @@ def make_brief(con, part=None, projects=None):
             ""]
     out = list(head)
     seen = set()
+    focus_id, focus_of = current_focus(con)
 
     def brief_line(r, quote=0, age=False):
         b = basis_label(r["basis"], short=True)
@@ -777,7 +789,9 @@ def make_brief(con, part=None, projects=None):
                              b, f"{days_since(r['created'])} d" if age else "") if x]
         if extra:
             s += f" [{', '.join(extra)}]"
-        if quote and r["quote"]:
+        if r["id"] == focus_id and part == "b":
+            s += " (the current focus: its full text is in part a)"
+        elif quote and r["quote"]:
             qt = r["quote"].replace("\n", " ")
             s += f'\n  "{qt[:quote]}{"…" if len(qt) > quote else ""}"'
         return s
@@ -799,13 +813,17 @@ def make_brief(con, part=None, projects=None):
     live = "('open','active','in-progress','waiting','blocked','proposed')"
     order = f" ORDER BY priority, {NUM}"
     if part in (None, "a"):
-        f = get_state(con, fk("focus"))
+        f = focus_id
         out.append("## Current focus")
-        if f and f != "none":
+        if f:
             r = con.execute("SELECT * FROM items WHERE id=?", (f,)).fetchone()
-            fq = get_state(con, fk("focus_quote"))
-            out.append(f"- {f} {r['title'] if r else '(missing item)'} [set {get_state(con, fk('focus_set'))}]"
+            fq = get_state(con, fk("focus_quote", focus_of))
+            every = ", for every project" if SHARED and focus_of == "all" else ""
+            out.append(f"- {f} {r['title'] if r else '(missing item)'} "
+                       f"[set {get_state(con, fk('focus_set', focus_of))}{every}]"
                        + (f'\n  {OWNER}: "{fq[:300]}"' if fq else ""))
+            if r and r["body"]:  # printed whole: it's what every step is checked against
+                out.extend("  " + x for x in r["body"].splitlines())
         else:
             out.append(f"- None chosen: {OWNER} hasn't picked the next step. Don't start a new work stream on your "
                        "own; answer what they ask, and put the waiting questions to them.")
@@ -901,8 +919,8 @@ def write_html(con, items, links):
     waiting = sorted((i for i in items if i["owner"] == "owner" and i["status"] in LIVE),
                      key=lambda i: (i["priority"], i["created"]))
     secs = []
-    fid = get_state(con, fk("focus"))
-    if fid and fid != "none" and fid in by:
+    fid = current_focus(con)[0]
+    if fid and fid in by:
         secs.append("<h2>Current focus</h2>" + card(by[fid], anchor=False))
     if waiting:
         secs.append(f"<h2>Waiting on {e(OWNER)}</h2>" + "".join(card(i, anchor=False) for i in waiting))
@@ -1226,14 +1244,15 @@ def cmd_override(con, args):
 
 def cmd_focus(con, args):
     pos, op = parse_opts(args)
+    proj = op.get("project") if isinstance(op.get("project"), str) else None  # shared: "all" = every project
     if not pos:
-        print(get_state(con, fk("focus")) or "none")
+        print(get_state(con, fk("focus", proj)) or "none")
         return
     if pos[0] != "none":
         get(con, pos[0])
-    set_state(con, fk("focus"), pos[0])
-    set_state(con, fk("focus_quote"), op.get("quote", ""))
-    set_state(con, fk("focus_set"), now())
+    set_state(con, fk("focus", proj), pos[0])
+    set_state(con, fk("focus_quote", proj), op.get("quote", ""))
+    set_state(con, fk("focus_set", proj), now())
     log(con, "focus", pos[0], {"quote": op.get("quote", "")})
     con.commit()
     print(f"focus: {pos[0]}")

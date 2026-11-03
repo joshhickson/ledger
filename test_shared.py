@@ -186,7 +186,19 @@ try:
     check("check stays in the project", "Shed paint" not in run(*B, "check", "paint", "green"))
     check("list stays in the project unless asked", "Shed paint" not in run(*B, "list")
           and "Shed paint" in run(*B, "list", "--all-projects"))
+    long_body = "Focus: grow food.\n- Why: " + "tomatoes and beans, " * 50 + "END-OF-FOCUS"
+    run(*A, "add", "goal", "Grow our own food", "--project", "all", "--body", long_body, "--quote", long_body)
+    out = run(*A, "focus", "G1", "--project", "all")
+    a = context(run(*B, "hook-start", "a", stdin={"cwd": tmp}))
+    check("a focus set on 'all' heads part a of a project that has none, printed whole (past 600 characters)",
+          "G1 Grow our own food" in a and "for every project" in a and "END-OF-FOCUS" in a
+          and "- Why: tomatoes" in a, a[:1500])
+    b = context(run(*B, "hook-start", "b", stdin={"cwd": tmp}))
+    check("part b lists the focus goal without a cut-off copy of its text",
+          "G1 Grow our own food" in b and "full text is in part a" in b and "END-OF-FOCUS" not in b, b)
     os.environ["LEDGER_PROJECT"] = "shed"
+    check("a project's own focus wins over the one on 'all'",
+          "R2 Shed paint" in context(run(*B, "hook-start", "a", stdin={"cwd": tmp})).split("## Read first")[0])
     check("the shed session sees its focus", "R2 Shed paint" in context(run(*B, "hook-start", "a",
                                                                           stdin={"cwd": tmp})))
     os.environ["LEDGER_PROJECT"] = "garden"
