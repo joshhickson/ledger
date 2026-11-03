@@ -57,7 +57,7 @@ All examples use a made-up recipe-website project. [Checked: `demo/make-sample-r
 ### Who did what
 
 AI coding agents (Claude Code) designed and wrote all of the code, tests and documentation under Josh's direction.
-Josh does not write or read code. [Checked: README.md; the owner's brief for this showcase] The repository's own
+[Checked: README.md] The repository's own
 record is thin: one squashed commit under Josh's account, co-authored by Claude, and a licence in his name. Nothing in
 it says who proposed which idea. [Checked: `git log`, LICENSE] The code still converts an older ledger's labels and
 has an `import` command for an earlier multi-project version, so there was at least one earlier version.

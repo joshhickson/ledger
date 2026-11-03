@@ -7,7 +7,7 @@ compacted (summarised to save space), and flag a message that seems to change an
 ## How this was made
 
 AI coding agents (Claude Code) designed and wrote all of the code, tests and documentation in this repository, under
-the direction of Joshua Hickson, who does not write or read code. The repository's history is one squashed commit, so
+the direction of Joshua Hickson. The repository's history is one squashed commit, so
 it doesn't record who proposed which idea.
 
 ## Status, read this first
