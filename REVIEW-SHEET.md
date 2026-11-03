@@ -46,8 +46,8 @@ The repo is **already public**. What changes is `main`: it would move forward to
 1. **The older first name** in `ledger.py` (once) and the tests (audit C12; I haven't repeated it). Is it a real
    person? If so, an agent swaps it for a placeholder before main moves.
 2. **Other public branches.** `analysis/portfolio-2026-11`, `portfolio/showcase`, `portfolio/nov4`,
-   `audit/2026-11`, `supabase-shared-e2e` and `claude/portfolio-nov4-9979pk` are all visible too. Your earlier
-   answer on most of them was "decide later".
+   `audit/2026-11`, `supabase-shared` and `supabase-shared-e2e` are all visible too. Your earlier answer on most of
+   them was "decide later". (The `claude/portfolio-nov4-9979pk` branch the handback mentions is already gone.)
 
 ## How it goes up (your step)
 
