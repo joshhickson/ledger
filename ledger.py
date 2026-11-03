@@ -369,6 +369,49 @@ PULL_FRESH = 20  # seconds; hook-start a and b, run back to back, share one pull
 TIMEOUT = 15  # seconds per request; hooks use HOOK_TIMEOUT
 HOOK_TIMEOUT = 6
 SNAP = None  # the cache as last pulled or pushed: what a command's changes are measured against
+IN_HOOK = False  # running as a hook: stdout is the hook's JSON
+NO_SYNC = False  # set when another session on this machine holds the cache lock: read the cache, don't pull or push
+
+
+class CacheLock:
+    """One command at a time per cache, from its pull to its push. Without it, a session on the same machine could
+    refresh the cache between another session saving a new item and sending it, and the item would never be sent.
+    The operating system drops the lock if the process dies."""
+
+    def __init__(self, path):
+        self.path, self.f = path, None
+
+    def acquire(self, timeout):
+        self.f = open(self.path, "a+b")
+        deadline = time.time() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if time.time() >= deadline:
+                    self.f.close()
+                    self.f = None
+                    return False
+                time.sleep(0.05)
+
+    def release(self):
+        if self.f:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            self.f.close()
+            self.f = None
 
 
 class SharedError(Exception):
@@ -456,6 +499,9 @@ def pull(con):
 
 def shared_sync(con, fresh=False):
     global SNAP
+    if NO_SYNC:
+        SNAP = snapshot(con)
+        return
     try:
         if flush_outbox() and (fresh or time.time() - float(get_state(con, "local_pulled_ts") or 0) > PULL_FRESH):
             pull(con)
@@ -502,9 +548,18 @@ def rename_in(batch, renamed):
     return batch
 
 
+def check_receipt(batch, res):
+    """The server lists the IDs it stored for new items; every new item sent must be among them."""
+    sent = sum(1 for it in batch.get("items", []) if it.get("_new"))
+    if "inserted" in res and len(res["inserted"]) != sent:
+        raise SharedError(f"the shared ledger stored {len(res['inserted'])} of the {sent} new items sent")
+
+
 def say_renamed(renamed):
+    """After the "added X" line, so it's the last word: a hook's stdout is JSON, so hooks get it on stderr."""
     for old, new in (renamed or {}).items():
-        print(f"ledger: another session had already used {old}, so the new item {old} is now {new}", file=sys.stderr)
+        print(f"ledger: CORRECTION: the new item is {new}, not {old}. Another session took {old} first; {old} is "
+              f"their item. Use {new} from now on.", file=sys.stderr if IN_HOOK else sys.stdout)
 
 
 def flush_outbox():
@@ -522,6 +577,7 @@ def flush_outbox():
             with open(OUTBOX, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(json.dumps(b, ensure_ascii=False) + "\n" for b in waiting[i:]))
             raise SharedError(f"{e}; {len(waiting) - i} change(s) wait in {OUTBOX}") from None
+        check_receipt(batch, res)
         renamed.update(res.get("renamed") or {})
         waiting[i] = batch
     os.remove(OUTBOX)
@@ -531,6 +587,10 @@ def flush_outbox():
 
 def shared_push(con):
     global SNAP
+    if NO_SYNC:
+        return
+    if os.environ.get("LEDGER_TEST_PAUSE"):  # tests only: widen the gap between saving a change and sending it
+        time.sleep(float(os.environ["LEDGER_TEST_PAUSE"]))
     batch = changes(con)
     if not batch:
         return
@@ -545,6 +605,12 @@ def shared_push(con):
               file=sys.stderr)
         SNAP = snapshot(con)
         return
+    try:
+        check_receipt(batch, res)
+    except SharedError as e:
+        set_state(con, "local_problem", str(e))
+        con.commit()
+        print(f"ledger: WARNING: {e}. Run `list --all` and re-add anything missing.", file=sys.stderr)
     if res.get("renamed"):
         say_renamed(res["renamed"])
         try:
@@ -1613,9 +1679,28 @@ def main():
     if c.startswith("hook-") and not (in_scope(hin) or "--force" in rest):
         return
     write = c in ("add", "set", "link", "override", "focus", "import")
-    if c.startswith("hook-"):
-        global TIMEOUT
+    global TIMEOUT, NO_SYNC, IN_HOOK
+    IN_HOOK = c.startswith("hook-")
+    if IN_HOOK:
         TIMEOUT = HOOK_TIMEOUT
+    lock = None
+    NO_SYNC = False
+    if SHARED:
+        lock = CacheLock(os.path.join(LEDGER_DIR, "ledger.lock"))
+        if not lock.acquire(60 if write else 10):
+            lock = None
+            if write:
+                sys.exit("ledger: another session on this machine has been saving to the shared ledger for a minute; "
+                         "nothing was saved. Try the same command again.")
+            NO_SYNC = True  # a read: use the copy on this machine as it is
+    try:
+        run_command(c, rest, hin, write)
+    finally:
+        if lock:
+            lock.release()
+
+
+def run_command(c, rest, hin, write):
     try:
         con = connect(fresh=write)
     except LedgerFileError as err:

@@ -71,7 +71,8 @@ class Server:
                                     project=ev.get("project") or b.get("project")))
         for st in b.get("state", []):
             self.state[st["key"]] = dict(st, value=renamed.get(st.get("value"), st.get("value")))
-        return {"renamed": renamed, "missing": missing, "by": "test"}
+        return {"renamed": renamed, "missing": missing, "by": "test",
+                "inserted": [renamed.get(i["id"], i["id"]) for i in b.get("items", []) if i.get("_new")]}
 
 
 def run(*args, stdin=None):
@@ -151,7 +152,7 @@ try:
     srv.before_push = other_session_adds_d2
     out = run(*A, "add", "decision", "Mulch the beds", "--quote", "mulch everything", "--serves", "R1")
     check("a new item whose ID another session took first is renumbered, and the session is told",
-          "D2 is now D3" in out and srv.items["D3"]["title"] == "Mulch the beds"
+          "the new item is D3, not D2" in out and srv.items["D3"]["title"] == "Mulch the beds"
           and srv.items["D2"]["title"] == "Raised beds", out)
     check("its links follow the new ID", ("D3", "serves", "R1") in srv.links, list(srv.links))
     check("the machine's cache follows too", "Mulch the beds" in run(*A, "show", "D3")

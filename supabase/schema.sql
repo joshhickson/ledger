@@ -74,13 +74,14 @@ end $$;
 -- One session's changes. p_batch: {project, items: [...], links: [...], events: [...], state: [...]}.
 -- A new item ("_new": true) whose ID another session already took gets the next free ID; the answer lists each
 -- rename as {"old": "new"}, and the batch's links, events and focus follow it. An edit sends only the fields it
--- changed, so two sessions changing different fields of one item don't undo each other.
+-- changed, so two sessions changing different fields of one item don't undo each other. "inserted" lists the IDs
+-- stored for new items: the client checks every new item it sent is there.
 create or replace function public.ledger_push(p_batch jsonb, p_token text default '') returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
   caller text := ledger.check_token(p_token);
   it jsonb; ln jsonb; ev jsonb; st jsonb;
-  nid text; pfx text; renamed jsonb := '{}'; missing jsonb := '[]';
+  nid text; pfx text; renamed jsonb := '{}'; missing jsonb := '[]'; inserted jsonb := '[]';
   n_items int := 0; n_links int := 0; n_events int := 0; n_state int := 0;
 begin
   perform pg_advisory_xact_lock(hashtext('ledger_push'));  -- one push at a time: new IDs can't collide
@@ -100,6 +101,7 @@ begin
               coalesce(it ->> 'basis', ''), coalesce(it ->> 'status', 'open'), coalesce(it ->> 'owner', ''),
               coalesce((it ->> 'priority')::int, 2), coalesce(it ->> 'tags', ''), it ->> 'created', it ->> 'updated',
               caller);
+      inserted := inserted || to_jsonb(nid);
     else
       nid := coalesce(renamed ->> nid, nid);
       update ledger.items set
@@ -146,7 +148,7 @@ begin
                                     pushed_at = now(), pushed_by = caller;
     n_state := n_state + 1;
   end loop;
-  return jsonb_build_object('renamed', renamed, 'missing', missing, 'by', caller,
+  return jsonb_build_object('renamed', renamed, 'inserted', inserted, 'missing', missing, 'by', caller,
                             'counts', jsonb_build_object('items', n_items, 'links', n_links,
                                                          'events', n_events, 'state', n_state));
 end $$;

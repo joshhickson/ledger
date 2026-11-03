@@ -52,8 +52,14 @@ it doesn't record who proposed which idea.
 Shared ledger only:
 
 - **Tried once each.** One local and one cloud session, a few minutes each, on test items. Not tried: the per-message
-  override check or a compaction in a cloud session, two sessions writing at the same moment for real (only
-  simulated), a long outage, and macOS or Linux machines.
+  override check or a compaction in a cloud session, a long outage, and macOS or Linux machines.
+- **Sessions writing at once (fixed 3 November 2026).** Until then, sessions on one computer share one local copy,
+  and one session could refresh it between another saving a new item and sending it. That item was never sent, with
+  no warning. In a test with 8 sessions on one computer writing at once, 7 of 8 items vanished. Now each command
+  holds a lock on the local copy from its fetch to its send, and the database's receipt is checked against every new
+  item sent. `test_concurrency.py` runs 8 writers at once (sharing a computer, and on separate ones). The live test
+  does the same against Supabase. A session that has to wait more than a minute for the lock saves nothing and says
+  so.
 - **Every hook waits for the network.** Each session start and each message you send pulls the record from Supabase:
   about 0.2 seconds in the tests. If Supabase is slow or down, a hook waits up to 6 seconds, then uses the last copy.
 - **One record for everything.** Item IDs are shared across all projects, so a new repository's first rule may be

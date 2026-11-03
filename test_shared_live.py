@@ -110,7 +110,26 @@ try:
     L.RPC = racing
     out = run(*A, "add", "note", f"Mine {stamp}")
     L.RPC = real
-    check("a clash on a new ID is renumbered on the server and reported", "is now N" in out, out)
+    check("a clash on a new ID is renumbered on the server and reported", "CORRECTION: the new item is N" in out, out)
+
+    # Several sessions writing at once, on one machine (one cache) and on separate machines.
+    import subprocess
+    tool = os.path.join(HERE, "ledger.py")
+    own = []
+    for i in range(4):
+        d = os.path.join(tmp, f"m{i}", ".ledger")
+        os.makedirs(d)
+        with open(os.path.join(d, "config.json"), "w") as f:
+            json.dump({"owner": "Tester", "backend": "supabase"}, f)
+        own.append(d)
+    env = dict(os.environ, LEDGER_TEST_PAUSE="0.3")
+    jobs = [(A[1], f"race same {stamp} {i}") for i in range(4)] + [(own[i], f"race own {stamp} {i}") for i in range(4)]
+    procs = [subprocess.Popen([sys.executable, tool, "--dir", d, "add", "task", t], env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, encoding="utf-8") for d, t in jobs]
+    outs = [p.communicate(timeout=180)[0] for p in procs]
+    listed = run(*B, "list", "--kind", "task")
+    check("8 sessions adding at once (4 sharing one machine): all 8 items are in the database, once each",
+          all(listed.count(f"{t} —") == 1 for _, t in jobs), (listed, outs))
 
     os.environ["LEDGER_TOKEN"] = "lt_wrong"
     a = context(run(*B, "hook-start", "a", stdin={"cwd": tmp}))
