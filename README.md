@@ -7,24 +7,27 @@ compacted (summarised to save space), and flag a message that seems to change an
 ## How this was made
 
 AI coding agents (Claude Code) designed and wrote all of the code, tests and documentation in this repository, under
-the direction of Joshua Hickson. The repository's history is one squashed commit, so
-it doesn't record who proposed which idea.
+the direction of Joshua Hickson.
 
 ## Status, read this first
 
-- **Tests:** the 55 checks in `test_ledger.py` pass (Python 3.13, about 1.3 seconds). The shared ledger adds 40
-  checks in `test_shared.py` (no network: a stand-in plays the database) and 10 in `test_shared_live.py` against a
-  real Supabase project; all pass (Python 3.10 on Windows).
-- **Real Claude Code sessions:** until 2 November 2026 this published version had never run in a real Claude Code
-  session. On that day it was run in short test sessions only (Claude Code 2.1.316: five headless runs and one
-  interactive session) on a made-up sample record, in a throwaway container. The hooks fired each time.
-  [`showcase/demo/`](showcase/demo/) has the transcripts and screenshots.
-- **Shared ledger, 2 November 2026:** one headless Claude Code session on Windows (2.1.296) and one cloud session
-  were run against a real Supabase project. Both got the brief from the database at session start. The cloud session
-  read an item recorded on the Windows machine and wrote a note that the Windows machine then read. The cloud
-  session's token was added by the cloud environment's network secret and never reached the session.
-- **Day-to-day use:** none yet for this version. The owner's daily use was of an earlier, multi-project version that
-  isn't published here.
+- **In use:** since 2 November 2026 the shared ledger (below) is the record Josh's Claude Code sessions use to update
+  his whole portfolio, with several sessions running at once. Late that evening it held 86 items across 14 projects,
+  plus rules that apply to all of them; in one five-minute stretch, sessions added 40 items across 5 projects. That
+  is real use, but only days of it.
+- **Tests:** the 55 checks in `test_ledger.py` and the 44 in `test_shared.py` (no network: a stand-in plays the
+  database) pass, in a few seconds (Python 3.13, Linux). `test_shared_live.py` runs 10 checks against a real Supabase
+  project; they passed on Windows (Python 3.10) on an earlier commit (`a610fc0`). The three changes to `ledger.py`
+  since then were tested offline only.
+- **Test sessions, per-repository version:** on 2 November 2026 it ran in short test sessions (Claude Code 2.1.316:
+  five headless runs and one interactive session) on a made-up sample record, in a throwaway container. The hooks
+  fired each time. [`showcase/demo/`](showcase/demo/) has the transcripts and screenshots.
+- **Test sessions, shared ledger, 2 November 2026:** one headless Claude Code session on Windows (2.1.296) and one
+  cloud session were run against a real Supabase project. Both got the brief from the database at session start. The
+  cloud session read an item recorded on the Windows machine and wrote a note that the Windows machine then read. The
+  cloud session's token was added by the cloud environment's network secret and never reached the session.
+- **The per-repository version** hasn't had day-to-day use. Before this, the owner used an earlier multi-project
+  version every day; it isn't published here.
 
 ## Known limits
 
@@ -43,17 +46,19 @@ it doesn't record who proposed which idea.
   doesn't show them on screen, even in its transcript view. Run `ledger.py brief` to read the brief yourself.
 - **Paths.** The hooks, brief and LEDGER CHECK note contain absolute paths on your machine, including your home
   folder. Check before you share a screenshot.
-- **Not tested at all:** long sessions, a real `/compact`, Windows, `import` from a real older ledger, and use over
-  weeks.
+- **Not tested at all:** long sessions, a real `/compact`, the per-repository version on Windows (the shared ledger
+  has run there; see Status), `import` from a real older ledger, and use over weeks.
 - **Small things:** `add --created` accepts any text without checking it's a date in the tool's format
   (`YYYY-MM-DD HH:MM`); the note `init` adds to CLAUDE.md says `python`, which some systems call `python3`.
 - **Privacy:** the ledger keeps your words verbatim. In a public repository anyone can read them; use `init --private`.
 
 Shared ledger only:
 
-- **Tried once each.** One local and one cloud session, a few minutes each, on test items. Not tried: the per-message
-  override check or a compaction in a cloud session, two sessions writing at the same moment for real (only
-  simulated), a long outage, and macOS or Linux machines.
+- **Tested once each, then used.** The tests were one local and one cloud session, a few minutes each, on test
+  items. Since then Josh's cloud sessions have used it for real (see Status). In at least one of those sessions an
+  instruction in the user's own CLAUDE.md told the session to run `brief` first, and the hooks weren't installed, so
+  the per-message override check didn't run. Not tested: the per-message check or a compaction in a cloud session, two sessions
+  writing the same item at the same moment (only simulated), a long outage, and macOS or Linux machines.
 - **Every hook waits for the network.** Each session start and each message you send pulls the record from Supabase:
   about 0.2 seconds in the tests. If Supabase is slow or down, a hook waits up to 6 seconds, then uses the last copy.
 - **One record for everything.** Item IDs are shared across all projects, so a new repository's first rule may be
@@ -110,9 +115,11 @@ took under two seconds.
 
 5. Open `.ledger/ledger.html` in a browser. That's your view of the record.
 
-6. Start Claude Code in the folder (`claude`), and send `actually let's switch to React`. In the test run the
-   assistant named D1, quoted "plain HTML it is, no framework" with its date, and asked whether to change it for good,
-   make a one-time exception or keep it, before changing anything.
+6. Start Claude Code in the folder (`claude`), and send `actually let's switch to React`. Expect the assistant to name
+   the framework decision, quote "plain HTML it is, no framework" with its date, and ask whether to change it for
+   good, make a one-time exception or keep it, before changing anything. That's what happened in the test runs: a
+   headless run (`claude -p`) on this 3-item record, and an interactive one on a larger made-up record (screenshot
+   [`4-reply-react.png`](showcase/demo/screenshots/4-reply-react.png)). Two runs, not a guarantee.
 
 7. Optional: stop the permission prompts for ledger commands. Add a `permissions` entry to
    `.claude/settings.local.json`, next to the `hooks` entry `init` wrote. Use the Python path that appears in the
